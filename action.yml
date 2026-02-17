@@ -31,9 +31,24 @@ runs:
         echo "🚀 Triggering deployment..."
         echo "   URL: $trigger_url"
 
-        response=$(curl -sf -X GET "$trigger_url" \
+        set +e
+        http_code=$(curl -s -w "%{http_code}" -o /tmp/trigger.json \
           -H "Authorization: Bearer $COOLIFY_TOKEN" \
-          -H "Content-Type: application/json")
+          -H "Content-Type: application/json" \
+          "$trigger_url" 2>/tmp/err.txt)
+        curl_exit=$?
+        set -e
+
+        response=$(cat /tmp/trigger.json 2>/dev/null || echo "")
+
+        if [[ $curl_exit -ne 0 ]]; then
+          echo "❌ Curl error: $(cat /tmp/err.txt 2>/dev/null || echo 'unknown')"
+          exit 1
+        elif [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+          echo "❌ Trigger failed with HTTP $http_code"
+          echo "   Response: $response"
+          exit 1
+        fi
 
         deployment_uuid=$(jq -r '.deployments[0].deployment_uuid' <<< "$response")
         echo "✅ Deployment triggered: $deployment_uuid"
