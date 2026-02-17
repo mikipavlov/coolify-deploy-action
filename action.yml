@@ -1,0 +1,106 @@
+name: "Deploy to Coolify"
+description: "Trigger Coolify deployment and poll for completion"
+author: "mikipavlov"
+
+inputs:
+  domain:
+    description: "Coolify instance domain (e.g., https://coolify.example.com)"
+    required: true
+  uuid:
+    description: "Application UUID to deploy"
+    required: true
+  token:
+    description: "Coolify API token"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Deploy
+      shell: bash
+      env:
+        COOLIFY_DOMAIN: ${{ inputs.domain }}
+        COOLIFY_UUID: ${{ inputs.uuid }}
+        COOLIFY_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+
+        domain=$(sed 's:/*$::' <<< "$COOLIFY_DOMAIN")
+        trigger_url="$domain/api/v1/deploy?uuid=$COOLIFY_UUID"
+
+        echo "🚀 Triggering deployment..."
+        echo "   URL: $trigger_url"
+
+        response=$(curl -sf -X GET "$trigger_url" \
+          -H "Authorization: Bearer $COOLIFY_TOKEN" \
+          -H "Content-Type: application/json")
+
+        deployment_uuid=$(jq -r '.deployments[0].deployment_uuid' <<< "$response")
+        echo "✅ Deployment triggered: $deployment_uuid"
+
+        poll_url="$domain/api/v1/deployments/$deployment_uuid"
+        echo "📡 Polling: $poll_url"
+
+        error_count=0
+        empty_count=0
+
+        for i in {1..60}; do
+          set +e
+          http_code=$(curl -s -w "%{http_code}" -o /tmp/res.json \
+            -H "Authorization: Bearer $COOLIFY_TOKEN" \
+            "$poll_url" 2>/tmp/err.txt)
+          curl_exit=$?
+          set -e
+
+          response=$(cat /tmp/res.json 2>/dev/null || echo "")
+          echo "[Poll $i/60] HTTP=$http_code curl_exit=$curl_exit"
+
+          if [[ $curl_exit -ne 0 ]]; then
+            error_count=$((error_count + 1))
+            echo "   ⚠️ Curl error: $(cat /tmp/err.txt 2>/dev/null || echo 'unknown')"
+          elif [[ -z "$http_code" ]]; then
+            error_count=$((error_count + 1))
+            echo "   ⚠️ Empty HTTP code"
+          elif [[ "$http_code" == "404" ]]; then
+            echo "   ⏳ Deployment not found yet..."
+            error_count=0
+          elif [[ "$http_code" == "403" ]]; then
+            echo "   ❌ Permission denied (403)"
+            echo "   Response: $response"
+            echo "   Hint: API token needs 'read' permission"
+            exit 1
+          elif [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+            error_count=$((error_count + 1))
+            echo "   ⚠️ HTTP $http_code: $response"
+          else
+            error_count=0
+            status=$(jq -r '.status // empty' <<< "$response" 2>/dev/null || echo "")
+            echo "   Status: '$status'"
+
+            case "$status" in
+              finished)
+                echo "✅ Deployment completed successfully"
+                exit 0
+                ;;
+              failed|cancelled|cancelled-by-user)
+                echo "❌ Deployment failed: $status"
+                exit 1
+                ;;
+              in_progress|queued)
+                : ;;
+              "")
+                empty_count=$((empty_count + 1))
+                [[ $empty_count -ge 10 ]] && { echo "ℹ️ Status empty 10x, assuming success"; exit 0; }
+                ;;
+              *)
+                echo "   ❓ Unknown status: $status"
+                ;;
+            esac
+          fi
+
+          [[ $error_count -ge 5 ]] && { echo "❌ Too many errors"; exit 1; }
+          sleep 3
+        done
+
+        echo "❌ Deployment polling timed out"
+        exit 1
