@@ -53,34 +53,22 @@ runs:
         deployment_uuid=$(jq -r '.deployments[0].deployment_uuid' <<< "$response")
         echo "✅ Deployment triggered: $deployment_uuid"
 
-        # Primary poll URL: direct deployment lookup
         poll_url="$domain/api/v1/deployments/$deployment_uuid"
-        # Fallback poll URL: list deployments for the application
-        fallback_url="$domain/api/v1/deployments/applications/$COOLIFY_UUID"
         echo "📡 Polling: $poll_url"
-        echo "   Fallback: $fallback_url"
 
         error_count=0
         empty_count=0
-        not_found_count=0
-        use_fallback=false
 
         for i in {1..60}; do
-          if [[ "$use_fallback" == "true" ]]; then
-            current_url="$fallback_url"
-          else
-            current_url="$poll_url"
-          fi
-
           set +e
           http_code=$(curl -s -w "%{http_code}" -o /tmp/res.json \
             -H "Authorization: Bearer $COOLIFY_TOKEN" \
-            "$current_url" 2>/tmp/err.txt)
+            "$poll_url" 2>/tmp/err.txt)
           curl_exit=$?
           set -e
 
           response=$(cat /tmp/res.json 2>/dev/null || echo "")
-          echo "[Poll $i/60] HTTP=$http_code curl_exit=$curl_exit (${use_fallback:+fallback}${use_fallback:-direct})"
+          echo "[Poll $i/60] HTTP=$http_code curl_exit=$curl_exit"
 
           if [[ $curl_exit -ne 0 ]]; then
             error_count=$((error_count + 1))
@@ -89,14 +77,8 @@ runs:
             error_count=$((error_count + 1))
             echo "   ⚠️ Empty HTTP code"
           elif [[ "$http_code" == "404" ]]; then
-            not_found_count=$((not_found_count + 1))
+            echo "   ⏳ Deployment not found yet..."
             error_count=0
-            if [[ "$use_fallback" == "false" && $not_found_count -ge 5 ]]; then
-              echo "   ⚠️ Direct endpoint returned 404 ${not_found_count}x, switching to fallback..."
-              use_fallback=true
-            else
-              echo "   ⏳ Deployment not found yet..."
-            fi
           elif [[ "$http_code" == "403" ]]; then
             echo "   ❌ Permission denied (403)"
             echo "   Response: $response"
@@ -107,26 +89,8 @@ runs:
             echo "   ⚠️ HTTP $http_code: $response"
           else
             error_count=0
-
-            if [[ "$use_fallback" == "true" ]]; then
-              # Extract status from the application deployments list
-              status=$(jq -r --arg uuid "$deployment_uuid" \
-                '[.[] | select(.deployment_uuid == $uuid)] | first | .status // empty' \
-                <<< "$response" 2>/dev/null || echo "")
-
-              # If deployment not found in list, check the latest deployment
-              if [[ -z "$status" ]]; then
-                status=$(jq -r 'first | .status // empty' <<< "$response" 2>/dev/null || echo "")
-                if [[ -n "$status" ]]; then
-                  echo "   Status (latest deployment): '$status'"
-                fi
-              else
-                echo "   Status: '$status'"
-              fi
-            else
-              status=$(jq -r '.status // empty' <<< "$response" 2>/dev/null || echo "")
-              echo "   Status: '$status'"
-            fi
+            status=$(jq -r '.status // empty' <<< "$response" 2>/dev/null || echo "")
+            echo "   Status: '$status'"
 
             case "$status" in
               finished)
